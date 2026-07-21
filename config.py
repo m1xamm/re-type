@@ -1,10 +1,12 @@
 import os
 import sys
-import customtkinter as ctk
-import keyboard
 import json
 import webbrowser
 import subprocess
+import threading
+import ctypes
+import customtkinter as ctk
+import keyboard
 
 try:
     import winreg
@@ -13,67 +15,11 @@ except ImportError:
 
 APP_NAME = "ReType"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
 BASE_DIR = os.path.dirname(sys.argv[0])
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-editing_hotkey = False
-selected_hotkey = ["Ctrl", "Win"]
-current_lang = "RU"
-hook_handle = None
-active_hotkey = []
-captured_hotkey = []
-
-def get_worker_path():
-    if getattr(sys, "frozen", False):
-        return os.path.join(BASE_DIR, "ReTypeWorker.exe")
-    return os.path.join(BASE_DIR, "worker.py")
-
-def restart_worker():
-    if getattr(sys, "frozen", False):
-        subprocess.run(["taskkill", "/F", "/IM", "ReTypeWorker.exe"], capture_output=True)
-        worker_path = get_worker_path()
-        if os.path.exists(worker_path):
-            subprocess.Popen([worker_path], creationflags=subprocess.CREATE_NO_WINDOW)
-    else:
-        # In dev, we can restart it using pythonw
-        subprocess.run(["taskkill", "/F", "/IM", "pythonw.exe"], capture_output=True)
-        worker_path = get_worker_path()
-        if os.path.exists(worker_path):
-            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-            if os.path.exists(pythonw):
-                subprocess.Popen([pythonw, worker_path], creationflags=subprocess.CREATE_NO_WINDOW)
-
-def load_config():
-    global selected_hotkey, current_lang
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            data = json.load(f)
-            if "hotkey" in data:
-                selected_hotkey = data["hotkey"]
-            if "lang" in data:
-                current_lang = data["lang"]
-    except Exception:
-        pass
-
-def save_config():
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump({
-                "hotkey": selected_hotkey,
-                "lang": current_lang
-            }, f)
-        restart_worker()
-    except Exception:
-        pass
-
-load_config()
-restart_worker()
-
-app = ctk.CTk()
-app.resizable(False, False)
-app.geometry("350x500")
-app.title("ReType Config")
+WM_USER = 0x0400
+WM_RELOAD_CONFIG = WM_USER + 1
 
 TRANSLATIONS = {
     "EN": {
@@ -90,299 +36,256 @@ TRANSLATIONS = {
     }
 }
 
-label_cfg = ctk.CTkLabel(
-    app,
-    text=TRANSLATIONS[current_lang]["config"],
-    font=("Arial", 38, "bold")
-)
-label_cfg.place(x=18, y=18)
+class ReTypeConfigApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
 
-def change_language(new_lang):
-    global current_lang
-    current_lang = new_lang
-    label_cfg.configure(text=TRANSLATIONS[current_lang]["config"])
-    label_hk.configure(text=TRANSLATIONS[current_lang]["hotkey"])
-    label_autostart.configure(text=TRANSLATIONS[current_lang]["autostart"])
-    update_display_text()
-    save_config()
+        self.title("ReType Config")
+        self.geometry("350x500")
+        self.resizable(False, False)
 
-lang_switch = ctk.CTkSegmentedButton(
-    app, 
-    values=["EN", "RU"], 
-    command=change_language,
-    width=80
-)
-lang_switch.place(x=250, y=25)
-lang_switch.set(current_lang)
+        self.selected_hotkey = ["Ctrl", "Win"]
+        self.current_lang = "RU"
+        self.editing_hotkey = False
+        self.active_hotkey = []
+        self.captured_hotkey = []
+        self.hook_handle = None
 
-frame_hk = ctk.CTkFrame(
-    app,
-    width=330,
-    height=60,
-    corner_radius=14,
-    fg_color="#2B2B2B",
-    border_width=1,
-    border_color="#444444"
-)
-frame_hk.place(x=10, y=75)
+        self.load_config()
+        self.trigger_worker()
 
-label_hk = ctk.CTkLabel(
-    frame_hk,
-    text=TRANSLATIONS[current_lang]["hotkey"],
-    font=("Arial", 20, "bold"),
-    fg_color="transparent"
-)
-label_hk.place(x=15, y=15)
+        self.setup_ui()
+        self.update_ui_language()
+        self.update_hotkey_ui()
+        self.update_display_text()
 
-frame_hk_display = ctk.CTkFrame(
-    frame_hk,
-    width=170,
-    height=50,
-    corner_radius=10,
-    fg_color="#1B1B1B",
-    border_width=1,
-    border_color="#4A4A4A"
-)
-frame_hk_display.place(x=100, y=5)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-hotkey_display = ctk.CTkLabel(
-    frame_hk_display,
-    text="",
-    font=("Segoe UI", 16, "bold"),
-    fg_color="transparent",
-    text_color="#F2F2F2"
-)
-hotkey_display.place(relx=0.5, rely=0.5, anchor="center")
-
-frame_autostart = ctk.CTkFrame(
-    app,
-    width=330,
-    height=60,
-    corner_radius=14,
-    fg_color="#2B2B2B",
-    border_width=1,
-    border_color="#444444"
-)
-frame_autostart.place(x=10, y=145)
-
-label_autostart = ctk.CTkLabel(
-    frame_autostart,
-    text=TRANSLATIONS[current_lang]["autostart"],
-    font=("Arial", 20, "bold"),
-    fg_color="transparent"
-)
-label_autostart.place(x=15, y=15)
-
-def get_startup_command():
-    worker_path = get_worker_path()
-    if getattr(sys, "frozen", False):
-        return f'"{worker_path}"'
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    interpreter = pythonw if os.path.exists(pythonw) else sys.executable
-    return f'"{interpreter}" "{worker_path}"'
-
-def is_autostart_enabled():
-    if winreg is None:
-        return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ)
-        winreg.QueryValueEx(key, APP_NAME)
-        winreg.CloseKey(key)
-        return True
-    except OSError:
-        return False
-
-def set_autostart(enabled):
-    if winreg is None:
-        return
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE)
-    except OSError:
-        return
-    if enabled:
-        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, get_startup_command())
-    else:
+    def load_config(self):
         try:
-            winreg.DeleteValue(key, APP_NAME)
+            with open(CONFIG_FILE, "r") as f:
+                data = json.load(f)
+                self.selected_hotkey = data.get("hotkey", ["Ctrl", "Win"])
+                self.current_lang = data.get("lang", "RU")
+        except Exception:
+            pass
+
+    def save_config(self):
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({
+                    "hotkey": self.selected_hotkey,
+                    "lang": self.current_lang
+                }, f)
+            self.trigger_worker()
+        except Exception:
+            pass
+
+    def get_worker_path(self):
+        if getattr(sys, "frozen", False):
+            return os.path.join(BASE_DIR, "ReTypeWorker.exe")
+        return os.path.join(BASE_DIR, "worker.py")
+
+    def trigger_worker(self):
+        # IPC: find worker window and send reload message
+        hwnd = ctypes.windll.user32.FindWindowW("ReTypeTrayClass", None)
+        if hwnd:
+            ctypes.windll.user32.PostMessageW(hwnd, WM_RELOAD_CONFIG, 0, 0)
+        else:
+            # Start worker
+            worker_path = self.get_worker_path()
+            if os.path.exists(worker_path):
+                if getattr(sys, "frozen", False):
+                    subprocess.Popen([worker_path], creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                    if not os.path.exists(pythonw): pythonw = sys.executable
+                    subprocess.Popen([pythonw, worker_path], creationflags=subprocess.CREATE_NO_WINDOW)
+
+    def setup_ui(self):
+        self.label_cfg = ctk.CTkLabel(self, text="", font=("Arial", 38, "bold"))
+        self.label_cfg.place(x=18, y=18)
+
+        self.lang_switch = ctk.CTkSegmentedButton(self, values=["EN", "RU"], command=self.change_language, width=80)
+        self.lang_switch.place(x=250, y=25)
+        self.lang_switch.set(self.current_lang)
+
+        # Hotkey section
+        self.frame_hk = ctk.CTkFrame(self, width=330, height=60, corner_radius=14, fg_color="#2B2B2B", border_width=1, border_color="#444444")
+        self.frame_hk.place(x=10, y=75)
+
+        self.label_hk = ctk.CTkLabel(self.frame_hk, text="", font=("Arial", 20, "bold"), fg_color="transparent")
+        self.label_hk.place(x=15, y=15)
+
+        self.frame_hk_display = ctk.CTkFrame(self.frame_hk, width=170, height=50, corner_radius=10, fg_color="#1B1B1B", border_width=1, border_color="#4A4A4A")
+        self.frame_hk_display.place(x=100, y=5)
+
+        self.hotkey_display = ctk.CTkLabel(self.frame_hk_display, text="", font=("Segoe UI", 16, "bold"), fg_color="transparent", text_color="#F2F2F2")
+        self.hotkey_display.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.btn_edit_hk = ctk.CTkButton(self.frame_hk, text="✎", command=self.btn_edit_hk_event, font=("Segoe UI Symbol", 20), width=42, height=46, corner_radius=8, fg_color="#4A4A4A", hover_color="#626262", text_color="white")
+        self.btn_edit_hk.place(x=280, y=7)
+
+        # Autostart section
+        self.frame_autostart = ctk.CTkFrame(self, width=330, height=60, corner_radius=14, fg_color="#2B2B2B", border_width=1, border_color="#444444")
+        self.frame_autostart.place(x=10, y=145)
+
+        self.label_autostart = ctk.CTkLabel(self.frame_autostart, text="", font=("Arial", 20, "bold"), fg_color="transparent")
+        self.label_autostart.place(x=15, y=15)
+
+        self.switch_autostart = ctk.CTkSwitch(self.frame_autostart, text="", command=self.on_autostart_toggle, onvalue=1, offvalue=0)
+        self.switch_autostart.place(x=270, y=18)
+
+        if winreg is None:
+            self.switch_autostart.configure(state="disabled")
+        elif self.is_autostart_enabled():
+            self.switch_autostart.select()
+        else:
+            self.switch_autostart.deselect()
+
+        # Footer
+        self.version_label = ctk.CTkLabel(self, text="ReType v1.0", text_color="#888888", font=("Arial", 12))
+        self.version_label.place(x=15, y=475, anchor="w")
+
+        self.github_label = ctk.CTkLabel(self, text="GitHub", text_color="#888888", font=("Arial", 12, "underline"), cursor="hand2")
+        self.github_label.place(x=335, y=475, anchor="e")
+        self.github_label.bind("<Button-1>", lambda e: webbrowser.open_new("https://github.com/m1xamm/re-type"))
+
+    def change_language(self, new_lang):
+        self.current_lang = new_lang
+        self.update_ui_language()
+        self.save_config()
+
+    def update_ui_language(self):
+        t = TRANSLATIONS[self.current_lang]
+        self.label_cfg.configure(text=t["config"])
+        self.label_hk.configure(text=t["hotkey"])
+        self.label_autostart.configure(text=t["autostart"])
+        self.update_display_text()
+
+    def get_startup_command(self):
+        worker_path = self.get_worker_path()
+        if getattr(sys, "frozen", False):
+            return f'"{worker_path}"'
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        interpreter = pythonw if os.path.exists(pythonw) else sys.executable
+        return f'"{interpreter}" "{worker_path}"'
+
+    def is_autostart_enabled(self):
+        if winreg is None: return False
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except OSError:
+            return False
+
+    def on_autostart_toggle(self):
+        if winreg is None: return
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE)
+            if self.switch_autostart.get() == 1:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, self.get_startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except OSError:
+                    pass
+            winreg.CloseKey(key)
         except OSError:
             pass
-    winreg.CloseKey(key)
 
-def on_autostart_toggle():
-    set_autostart(switch_autostart.get() == 1)
-
-switch_autostart = ctk.CTkSwitch(
-    frame_autostart,
-    text="",
-    command=on_autostart_toggle,
-    onvalue=1,
-    offvalue=0
-)
-switch_autostart.place(x=270, y=18)
-
-if winreg is None:
-    switch_autostart.configure(state="disabled")
-elif is_autostart_enabled():
-    switch_autostart.select()
-else:
-    switch_autostart.deselect()
-
-def update_hotkey_ui():
-    if editing_hotkey:
-        frame_hk_display.configure(
-            fg_color="#222222",
-            border_color="#7A7A7A",
-            border_width=2
-        )
-        btn_edit_hk.configure(
-            fg_color="#5A5A5A",
-            hover_color="#6C6C6C"
-        )
-    else:
-        frame_hk_display.configure(
-            fg_color="#1B1B1B",
-            border_color="#4A4A4A",
-            border_width=1
-        )
-        btn_edit_hk.configure(
-            fg_color="#4A4A4A",
-            hover_color="#626262"
-        )
-    hotkey_display.configure(text_color="#F2F2F2")
-
-def update_display_text():
-    if editing_hotkey:
-        if active_hotkey:
-            hotkey_display.configure(text="+".join(active_hotkey))
+    def update_hotkey_ui(self):
+        if self.editing_hotkey:
+            self.frame_hk_display.configure(fg_color="#222222", border_color="#7A7A7A", border_width=2)
+            self.btn_edit_hk.configure(fg_color="#5A5A5A", hover_color="#6C6C6C")
         else:
-            hotkey_display.configure(text=TRANSLATIONS[current_lang]["press_keys"])
-    else:
-        hotkey_display.configure(text="+".join(selected_hotkey))
+            self.frame_hk_display.configure(fg_color="#1B1B1B", border_color="#4A4A4A", border_width=1)
+            self.btn_edit_hk.configure(fg_color="#4A4A4A", hover_color="#626262")
+        self.hotkey_display.configure(text_color="#F2F2F2")
 
-def normalize_key_name(raw_name):
-    name = (raw_name or "").lower().strip()
-    if name in {"left ctrl", "right ctrl", "ctrl"}:
-        return "Ctrl"
-    if name in {"left alt", "right alt", "alt"}:
-        return "Alt"
-    if name in {"alt gr", "altgr"}:
-        return "AltGr"
-    if name in {"left shift", "right shift", "shift"}:
-        return "Shift"
-    if name in {"left windows", "right windows", "windows"}:
-        return "Win"
-    if name == "esc":
-        return "Esc"
-    if name == "space":
-        return "Space"
-    if name == "enter":
-        return "Enter"
-    if len(name) == 1:
-        return name.upper()
-    return name.title()
+    def update_display_text(self):
+        if self.editing_hotkey:
+            if self.active_hotkey:
+                self.hotkey_display.configure(text="+".join(self.active_hotkey))
+            else:
+                self.hotkey_display.configure(text=TRANSLATIONS[self.current_lang]["press_keys"])
+        else:
+            self.hotkey_display.configure(text="+".join(self.selected_hotkey))
 
-def finish_hotkey(cancel=False):
-    global editing_hotkey, selected_hotkey, active_hotkey, captured_hotkey, hook_handle
-    editing_hotkey = False
-    if hook_handle is not None:
-        keyboard.unhook(hook_handle)
-        hook_handle = None
-    if not cancel and captured_hotkey:
-        selected_hotkey = list(captured_hotkey)
-        save_config()
-    active_hotkey = []
-    captured_hotkey = []
-    update_display_text()
-    update_hotkey_ui()
+    def normalize_key_name(self, raw_name):
+        name = (raw_name or "").lower().strip()
+        if name in {"left ctrl", "right ctrl", "ctrl"}: return "Ctrl"
+        if name in {"left alt", "right alt", "alt"}: return "Alt"
+        if name in {"alt gr", "altgr"}: return "AltGr"
+        if name in {"left shift", "right shift", "shift"}: return "Shift"
+        if name in {"left windows", "right windows", "windows"}: return "Win"
+        if name == "esc": return "Esc"
+        if name == "space": return "Space"
+        if name == "enter": return "Enter"
+        if len(name) == 1: return name.upper()
+        return name.title()
 
-def process_keyboard_event(raw_name, event_type):
-    global active_hotkey, captured_hotkey
-    if not editing_hotkey:
-        return
-    name = normalize_key_name(raw_name)
+    def finish_hotkey(self, cancel=False):
+        self.editing_hotkey = False
+        if self.hook_handle is not None:
+            keyboard.unhook(self.hook_handle)
+            self.hook_handle = None
+        if not cancel and self.captured_hotkey:
+            self.selected_hotkey = list(self.captured_hotkey)
+            self.save_config()
+        self.active_hotkey = []
+        self.captured_hotkey = []
+        self.update_display_text()
+        self.update_hotkey_ui()
 
-    if event_type == "down":
-        if name == "Esc":
-            finish_hotkey(cancel=True)
+    def process_keyboard_event(self, raw_name, event_type):
+        if not self.editing_hotkey: return
+        name = self.normalize_key_name(raw_name)
+
+        if event_type == "down":
+            if name == "Esc":
+                self.finish_hotkey(cancel=True)
+                return
+            if name not in self.active_hotkey:
+                self.active_hotkey.append(name)
+            for key in self.active_hotkey:
+                if key not in self.captured_hotkey and len(self.captured_hotkey) < 3:
+                    self.captured_hotkey.append(key)
+            self.update_display_text()
+            self.update_hotkey_ui()
+            if len(self.active_hotkey) >= 3:
+                self.finish_hotkey()
+        elif event_type == "up":
+            if name in self.active_hotkey:
+                self.active_hotkey.remove(name)
+            self.update_display_text()
+            self.update_hotkey_ui()
+            if not self.active_hotkey and self.captured_hotkey:
+                self.finish_hotkey()
+
+    def keyboard_event_handler(self, event):
+        self.after(0, self.process_keyboard_event, event.name, event.event_type)
+
+    def btn_edit_hk_event(self):
+        if self.editing_hotkey:
+            self.finish_hotkey()
             return
-        if name not in active_hotkey:
-            active_hotkey.append(name)
-        for key in active_hotkey:
-            if key not in captured_hotkey and len(captured_hotkey) < 3:
-                captured_hotkey.append(key)
-        update_display_text()
-        update_hotkey_ui()
-        if len(active_hotkey) >= 3:
-            finish_hotkey()
-    elif event_type == "up":
-        if name in active_hotkey:
-            active_hotkey.remove(name)
-        update_display_text()
-        update_hotkey_ui()
-        if not active_hotkey and captured_hotkey:
-            finish_hotkey()
+        self.editing_hotkey = True
+        self.active_hotkey = []
+        self.captured_hotkey = []
+        self.update_display_text()
+        self.update_hotkey_ui()
+        self.hook_handle = keyboard.hook(self.keyboard_event_handler)
 
-def keyboard_event_handler(event):
-    app.after(0, process_keyboard_event, event.name, event.event_type)
+    def on_close(self):
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        self.destroy()
 
-def btn_edit_hk_event():
-    global editing_hotkey, active_hotkey, captured_hotkey, hook_handle
-    if editing_hotkey:
-        finish_hotkey()
-        return
-    editing_hotkey = True
-    active_hotkey = []
-    captured_hotkey = []
-    update_display_text()
-    update_hotkey_ui()
-
-    hook_handle = keyboard.hook(keyboard_event_handler)
-
-def on_close():
-    try:
-        keyboard.unhook_all()
-    except Exception:
-        pass
-    app.destroy()
-
-btn_edit_hk = ctk.CTkButton(
-    frame_hk,
-    text="✎",
-    command=btn_edit_hk_event,
-    font=("Segoe UI Symbol", 20),
-    width=42,
-    height=46,
-    corner_radius=8,
-    fg_color="#4A4A4A",
-    hover_color="#626262",
-    text_color="white"
-)
-btn_edit_hk.place(x=280, y=7)
-
-version_label = ctk.CTkLabel(
-    app, 
-    text="ReType v1.0", 
-    text_color="#888888", 
-    font=("Arial", 12)
-)
-version_label.place(x=15, y=475, anchor="w")
-
-def open_github(event):
-    webbrowser.open_new("https://github.com/m1xamm/re-type")
-
-github_label = ctk.CTkLabel(
-    app, 
-    text="GitHub", 
-    text_color="#888888", 
-    font=("Arial", 12, "underline"), 
-    cursor="hand2"
-)
-github_label.place(x=335, y=475, anchor="e")
-github_label.bind("<Button-1>", open_github)
-
-app.protocol("WM_DELETE_WINDOW", on_close)
-
-update_hotkey_ui()
-update_display_text()
-
-app.mainloop()
+if __name__ == "__main__":
+    app = ReTypeConfigApp()
+    app.mainloop()
