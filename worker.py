@@ -212,7 +212,15 @@ def convert_text(text):
     else:
         return ''.join(en_to_ru.get(c, c) for c in text)
 
+def release_modifiers():
+    send_key(0x10, 42, False) # Shift
+    send_key(0x11, 29, False) # Ctrl
+    send_key(0x12, 56, False) # Alt
+    send_key(0x5B, 91, False) # Win
+    time.sleep(0.01)
+
 def replace_text_action():
+    release_modifiers()
     original_clipboard = get_clipboard_text()
     
     send_ctrl_c()

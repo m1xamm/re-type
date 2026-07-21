@@ -40,6 +40,7 @@ class ReTypeConfigApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        ctk.set_appearance_mode("Dark")
         self.title("ReType Config")
         self.geometry("350x500")
         self.resizable(False, False)
